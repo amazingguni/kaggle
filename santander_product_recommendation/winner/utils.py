@@ -66,7 +66,7 @@ products = (
 dtypes = {
     "fecha_dato": str,
     "ncodpers": int,
-    "conyuemp": str, # Spouse index. 1 if the customer is spouse of an employee
+    "conyuemp": str, # Spouse index. 1 i the customer is spouse of an employee
 }
 
 

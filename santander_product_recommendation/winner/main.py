@@ -12,7 +12,10 @@ import numpy as np
 from sklearn.preprocessing import LabelEncoder
 
 # import engines
-from utils import products, dtypes, date_to_float, date_to_int
+from santander_product_recommendation.winner.utils import\
+    products, dtypes, date_to_float, date_to_int, mapk
+
+from santander_product_recommendation.winner import engines
 
 np.random.seed(2019)
 transformers = {}
@@ -258,6 +261,25 @@ def make_data():
     train_df = train_df[leave_columns]
     return train_df, features, prod_features
 
+def make_submission(f, Y_test, C):
+    Y_ret = []
+    # 파일의 첫 줄에 header를 쓴다
+    f.write('ncodpers,added_products\n'.encode('utf-8'))
+    # 고객 식별 번호(C)와, 예측 결과물(Y_test)의 for loop
+    for c, y_test in zip(C, Y_test):
+        # (확률값, 금융 변수명, 금융 변수 id)의 tuple을 구한다
+        y_prods = [(y,p,ip) for y,p,ip in zip(y_test, products, range(len(products)))]
+        # 확률값을 기준으로 상위 7개 결과만 추출한다
+        y_prods = sorted(y_prods, key=lambda a: a[0], reverse=True)[:7]
+        # 금융 변수 id를 Y_ret에 저장한다
+        Y_ret.append([ip for y,p,ip in y_prods])
+        y_prods = [p for y,p,ip in y_prods]
+        # 파일에 “고객 식별 번호, 7개의 금융 변수”를 쓴다
+        f.write(f'{int(c)},{" ".join(y_prods)}\n'.encode('utf-8'))
+    # 상위 7개 예측값을 반환한다
+    return Y_ret
+
+
 def train_predict(all_df, features, prod_features, str_date, cv):
     '''
     all_df: 통합 데이터
@@ -272,7 +294,7 @@ def train_predict(all_df, features, prod_features, str_date, cv):
     # 훈련 데이터는 test_date 이전의 모든 데이터를 사용한다.
     train_df = all_df[all_df.int_date < test_date]
     # 테스트 데이터를 통합 데이터에서 분리
-    test_df = pd.DataFrame(all_df[all_df.int_date == test_Date])
+    test_df = pd.DataFrame(all_df[all_df.int_date == test_date])
 
     # 신규 구매 고객만을 훈련 데이터로 추출한다
     X = []
@@ -288,7 +310,6 @@ def train_predict(all_df, features, prod_features, str_date, cv):
         Y.append(prY)
     
     XY = pd.concat(X)
-    print(len(X), XY.size())
     Y = np.hstack(Y)
     # XY는 신규 구매 데이터만 포함된다
     XY['y'] = Y
@@ -342,7 +363,7 @@ def train_predict(all_df, features, prod_features, str_date, cv):
     if cv:
         max_map7 = mapk(test_add_list, test_add_list, 7, 0.0)
         map7coef = float(len(test_add_list)) / float(sum([int(bool(a)) for a in test_add_list]))
-        print('Max MAP@7', str_date, max_map7, max_map7 * max7coef)
+        print('Max MAP@7', str_date, max_map7, max_map7 * map7coef)
     
     # LightGBM 모델 학습 후, 예측 결과물을 저장
     Y_test_lgbm = engines.lightgbm(
@@ -352,9 +373,43 @@ def train_predict(all_df, features, prod_features, str_date, cv):
         features, 
         XY_all=XY, 
         restore=(str_date == '2016-06-28'))
-    
+    test_add_list_lightgbm = make_submission(
+        io.BytesIO() if cv else gzip.open(f'{str_date}.lightgbm.csv.gz', 'wb'),
+        Y_test_lgbm - Y_prev, C
+    )
+    # 교차 검증일 경우, LightGBM 모델의 테스트 데이터 MAP@7를 출력
+    if cv:
+        # 정답값인 test_add_list와 lightGBM 모델의 예측값인 test_add_list_lightgbm을
+        # mapk 함수에 넣어 평가 척도 점수 확인
+        map7lightgbm = mapk(test_add_list, test_add_list_lightgbm, 7, 0.0)
+        print(f'LightGBMlib MAP@7 {str_date} {map7lightgbm} {map7lightgbm * map7coef}')
 
+    # XGBoost 모델 학습 후 예측 결과물 저장
+    Y_test_xgb = engines.xgboost(
+        XY_train, XY_validate, test_df, features, XY_all=XY, restore=(str_date == '2016-06-28'))
+    test_add_list_xgboost = make_submission(
+        io.BytesIO() if cv else gzip.open(f'{str_date}.xgboost.csv.gz', 'wb'),
+        Y_test_lgbm - Y_prev, C
+    )
+    # 교차 검증일 경우, XGBoost 모델의 테스트 데이터 MAP@7를 출력
+    if cv:
+        # 정답값인 test_add_list와 XGBoost 모델의 예측값인 test_add_list_xgboost
+        # mapk 함수에 넣어 평가 척도 점수 확인
+        map7xgboost = mapk(test_add_list, test_add_list_xgboost, 7, 0.0)
+        print(f'XBBoost MAP@7 {str_date} {map7xgboost} {map7xgboost * map7coef}')
 
+    # 곱셈 후, 제곱근을 구하는 방식으로 앙상블 수행
+    y_test = np.sqrt(np.multiply(Y_test_xgb, Y_test_lgbm))
+    # 앙상블 결과물을 저장하고, 테스트 데이터에 대한 MAP@7 출력
+    test_add_list_xl = make_submission(
+        io.BytesIO() if cv else gzip.open(f'{str_date}.xgboost-lightgbm.csv.gz', 'wb'),
+        y_test - Y_prev, C
+    )
+
+    # 정답값인 test_add_list와 앙상블 모델의 예측값을 MAPK 함수에 넣어 평가 척도 점수 확인
+    if cv:
+        map7xl = mapk(test_add_list, test_add_list_xl, 7, 0.0)
+        print(f'XGBoost + LightGBM MAP@7 {str_date} {map7xl} {map7xl * map7coef}')
 
 
 if __name__ == "__main__":
@@ -375,6 +430,6 @@ if __name__ == "__main__":
         all_df, features, prod_features = make_data()
         all_df.to_pickle(train_df_pickle_path)
         pickle.dump((features, prod_features), open(cv_meta_pickle_path, 'wb'))
-    Print('load finish')
+    print('load finish')
     train_predict(all_df, features, prod_features, "2016-05-28", cv=True)
     train_predict(all_df, features, prod_features, "2016-06-28", cv=False)
